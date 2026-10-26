@@ -1,0 +1,209 @@
+from abc import ABC, abstractmethod
+import unittest
+
+
+class IClient(ABC):
+    @abstractmethod
+    def get_city(self, lat: float, lon: float) -> str: pass
+
+
+class ICounter(ABC):
+    @abstractmethod
+    def can_request(self) -> bool: pass
+    @abstractmethod
+    def record(self) -> None: pass
+
+
+class IObserver(ABC):
+    @abstractmethod
+    def on_quota_exceeded(self) -> None: pass
+
+class ISubject(ABC):
+    @abstractmethod
+    def add_observer(self, observer: IObserver) -> None: pass
+
+
+# 1. СЕРВИС
+class Service:
+    def __init__(self):
+        self.limit = 5
+        self.used = 0
+        self.blocked = False
+
+    def request(self, lat: float, lon: float) -> str:
+        if self.blocked:
+            raise Exception("Ключ заблокирован!")
+        if self.used >= self.limit:
+            self.blocked = True
+            raise Exception("Лимит превышен!")
+        self.used += 1
+        return f"Город({lat},{lon})"
+
+
+# 2. SINGLETON
+class GlobalCounter(ICounter, ISubject):
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, service: Service = None):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self, service: Service = None):
+        if not GlobalCounter._initialized and service is not None:
+            self.service = service
+            self.allowed = 0
+            self.skipped = 0
+            self.observers = []
+            GlobalCounter._initialized = True
+
+    def add_observer(self, obs: IObserver):
+        self.observers.append(obs)
+
+    def can_request(self) -> bool:
+        if self.service.blocked or self.service.used >= self.service.limit:
+            self.skipped += 1
+            for obs in self.observers:
+                obs.on_quota_exceeded()
+            return False
+        return True
+
+    def record(self):
+        self.allowed += 1
+
+
+# 3. PROXY
+class Proxy(IClient):
+    def __init__(self, client: IClient, counter: ICounter):
+        self.client = client
+        self.counter = counter
+
+    def get_city(self, lat: float, lon: float) -> str:
+        if not self.counter.can_request():
+            return "Запрос заблокирован Proxy"
+        try:
+            result = self.client.get_city(lat, lon)
+            self.counter.record()
+            return result
+        except Exception as e:
+            return f"Ошибка: {e}"
+
+
+# 4. Клиент
+class RealClient(IClient):
+    def __init__(self, service: Service):
+        self.service = service
+
+    def get_city(self, lat: float, lon: float) -> str:
+        return self.service.request(lat, lon)
+
+
+class TestPatterns(unittest.TestCase):
+
+    def setUp(self):
+        GlobalCounter._instance = None
+        GlobalCounter._initialized = False
+
+    def test_singleton_returns_same_instance(self):
+        service = Service()
+        counter1 = GlobalCounter(service)
+        counter2 = GlobalCounter(service)
+        self.assertIs(counter1, counter2)
+
+    def test_singleton_not_reinitialized(self):
+        service1 = Service()
+        service2 = Service()
+        counter1 = GlobalCounter(service1)
+        counter1.allowed = 100
+        counter2 = GlobalCounter(service2)
+        self.assertEqual(counter2.allowed, 100)
+        self.assertIs(counter2.service, service1)
+
+    def test_proxy_blocks_excess_requests(self):
+        service = Service()
+        counter = GlobalCounter(service)
+        real_client = RealClient(service)
+        proxy = Proxy(real_client, counter)
+
+        for i in range(5):
+            result = proxy.get_city(55.0 + i, 37.0 + i)
+            self.assertIn("Город", result)
+
+        result = proxy.get_city(60.0, 42.0)
+        self.assertEqual(result, "Запрос заблокирован Proxy")
+        self.assertFalse(service.blocked)
+
+    def test_proxy_protects_service(self):
+        service = Service()
+        real_client = RealClient(service)
+
+        for i in range(5):
+            real_client.get_city(55.0 + i, 37.0 + i)
+
+        with self.assertRaises(Exception):
+            real_client.get_city(60.0, 42.0)
+
+        self.assertTrue(service.blocked)
+
+    def test_observer_receives_notifications(self):
+        class TestLogger(IObserver):
+            def __init__(self):
+                self.events = []
+            def on_quota_exceeded(self):
+                self.events.append("quota_exceeded")
+
+        service = Service()
+        counter = GlobalCounter(service)
+        logger = TestLogger()
+        counter.add_observer(logger)
+
+        real_client = RealClient(service)
+        proxy = Proxy(real_client, counter)
+
+        for i in range(5):
+            proxy.get_city(55.0 + i, 37.0 + i)
+
+        proxy.get_city(60.0, 42.0)
+        self.assertIn("quota_exceeded", logger.events)
+
+    def test_counter_statistics(self):
+        service = Service()
+        counter = GlobalCounter(service)
+        real_client = RealClient(service)
+        proxy = Proxy(real_client, counter)
+
+        for i in range(7):
+            proxy.get_city(55.0 + i, 37.0 + i)
+
+        self.assertEqual(counter.allowed, 5)
+        self.assertEqual(counter.skipped, 2)
+
+
+
+service = Service()
+counter = GlobalCounter(service)
+real_client = RealClient(service)
+proxy = Proxy(real_client, counter)
+
+print(f"\nЛимит сервиса: {service.limit} запросов")
+print("(отправляем запросы через прокси:)")
+
+for i in range(1, 10):
+    result = proxy.get_city(55.75 + i, 37.61 + i)
+    status = "✅" if "Город" in result else "🚫"
+    print(f"{status} Запрос #{i}: {result}")
+
+print()
+print("Итог:")
+print(f"✅ Разрешено запросов: {counter.allowed}")
+print(f"🚫 Заблокировано Proxy: {counter.skipped}")
+print(f"Сервис заблокирован: {service.blocked}")
+print()
+print("Вывод:")
+print("- Proxy остановил лишние запросы до сервиса")
+print("- Сервис не узнал о попытках превысить лимит")
+print("- Ключ не заблокирован, приложение работает")
+
+
+unittest.main()
